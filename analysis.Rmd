@@ -1,0 +1,1128 @@
+---
+title: "HCC_manuscript"
+author: "Chen"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(tidyverse)
+library(readxl)
+library(bswClst10)
+library(CCA)
+library(lme4)
+library(lmerTest)
+library(ggrepel)
+library(foreach)
+library(ggplot2)
+library(ggpmisc)
+library(ggforce)
+library(corrplot)
+library(ggpubr)
+library(gridExtra)
+library(ggridges)
+library(GGally)
+library(lubridate)
+library(matrixStats)
+library(scales)
+library(reshape2)  # for melt
+library(cowplot)   # for plot_grid
+library(EnvStats)
+library(mixOmics) # call mixOmics library
+library(Seurat)
+library(factoextra)
+library(FactoMineR)
+data_path <- '/Users/chenyuelu/iCloud/Desktop/things/HST/research/HCC/manuscript/data'
+output_path <- '/Users/chenyuelu/iCloud/Desktop/things/HST/research/HCC/manuscript/results'
+tissue_colors <- list('Tissue_Type'=c('Tumor'='forestgreen','Vessel'='red'))
+Hoshida_colors <- list('Hoshida_type'=c('S1'='black','S2'='dodgerblue3','S3'='green','Others'='ghostwhite'))
+tstage_colors <- list('tstage' = c('1'='forestgreen', '2'='yellow', '3'='orange', '4'='red','NA'='lightgrey'))
+fibrosis_colors <- list('fibrosis' = c('0'='forestgreen', '2'='cyan1', '3'='yellow', '4'='orange', '5'='red', '6'='purple', 'NA'='grey'))
+differentiation_colors <- list('differentiation' = c('well'='forestgreen', 'moderate'='yellow', 'moderate_poor'='orange', 'poor'='black','NA'='grey'))
+T1T2T3_colors <- list('subtype'=c('T1'='black','T2'='blue','T3'='forestgreen','Others'='lightgrey'))
+V1V2V3_colors <- list('subtype'=c('V1'='black','V2'='blue','V3'='forestgreen','Others'='lightgrey'))
+```
+### load GeoMx normalized counts and associated meta data 
+
+```{r include=TRUE, eval=TRUE}
+##### load up files from nanostring workflow qc results #####
+cts <- read.delim(paste0(data_path,'/qnormCounts.tsv')) # generated using NS workflow script
+
+# shorten sample names
+colnames(cts) <- gsub('\\.','-',colnames(cts))
+colnames(cts) <- gsub('.dcc','',colnames(cts))
+colnames(cts) <- gsub('DSP-100166000','',colnames(cts))
+
+##### meta file #####
+meta<-read_excel(paste0(data_path,'/HCCPatientID.xlsx')) %>% 
+  mutate(Sample_ID_short=gsub('DSP-100166000','',Sample_ID)) %>%
+  dplyr::select(-c('...12'))
+
+meta <- meta %>% 
+    mutate(Tissue_Type = case_when((segment=='Arginase+' & Comments=='Vessel') ~ 'Tumor',
+                                 (segment=='CD31+' & Comments=='Tumor') ~ 'Vessel',
+                                 TRUE ~ Comments)) %>% # fixed four AOIs
+    mutate(Sample_ID_short=substr(Sample_ID,14,nchar(Sample_ID))) %>%  
+    mutate(Slide_Type = case_when(str_detect(`slide name`,'TMA')~'TMA',
+                                  str_detect(`slide name`,'Control')~'Ctrl',
+                                  TRUE ~ 'Whole Slide')) %>%
+    mutate(path_number_short = map_chr(str_extract_all(str_extract(get('Surgical ID'),'[:alpha:]*\\d\\d\\_*[:alpha:]*\\d+'), '\\d+'), ~ str_c(.x, collapse="_"))) # standardize path_number ('Surgical ID') 
+
+meta_OG <- meta
+```
+
+
+### Hoshida gene sets
+
+```{r eval=TRUE}
+HoshidaGenes<-NA
+for (i in 1:3){
+  t<-read.delim(paste0(data_path,'/Hoshida_S',i,'.txt'))
+  t<-data.frame(t[2:nrow(t),],rep(i,nrow(t)-1))
+  HoshidaGenes<-rbind(HoshidaGenes, t) %>% na.omit()
+} 
+colnames(HoshidaGenes)<-c('Genes','Set')
+```
+
+
+### match with clinical database
+
+```{r include=TRUE, eval=TRUE, warning=FALSE}
+##### columns of interest #####
+survival <- read_excel(paste0(data_path, '/210_cases_oct9_2018_hcc_completed_database1_Emmett_08012022.xlsx'), sheet = 'clindata', range = cell_cols("A:AI"), col_types = c('text', 'numeric','text','numeric','text','date','numeric','date','date','text','text','text','text','text','date','date','text','numeric','numeric','numeric','numeric','text','text','text','text','text','text','text','text','text','text','text','text','text','text')) %>% head(210) %>% 
+  mutate(path_number_short = map_chr(str_extract_all(str_extract(path_number,'[:alpha:]*\\d\\d\\_*[:alpha:]*\\d+'), '\\d+'), ~ str_c(.x, collapse="_"))) # standardize path number
+
+##### manually fix a few entries #####
+survival[survival$mrn=='3859992',]$surg_date <- as.Date('2011-12-2')
+survival[survival$mrn=='519888',]$surg_date <- as.Date('2006-5-2')
+survival[survival$mrn=='2404949',]$Gender_1M_2F <- '1'
+survival[survival$mrn=='2404949',]$hcc_dx_date <- as.Date('2004-12-01')
+survival[survival$mrn=='4475336',]$Gender_1M_2F <- '1' 
+survival[survival$mrn=='4475336',]$hcc_dx_date <- as.Date('2007-3-19') # there are two different diagnosis dates -> I am choosing the slightly later one but it should not affect the results
+survival[survival$mrn=='4620118',]$hcc_dx_date <- as.Date('2008-6-18')
+survival[survival$mrn=='4097569',]$hcc_dx_date <- as.Date('2012-1-26')
+survival[survival$mrn=='3956791',]$death_date <- as.Date('2016-4-1') # for some reason death date was not read in for this patient
+survival <- survival %>% filter(path_number!='MS07_19307_C3') # remove this bc it was an biopsy from OSH and later repeated with MS07_G19307.
+
+# # only want resection or transplant samples
+# survival <- survival %>% filter(sample %in% c('resection','transplant'))
+```
+
+
+### merge tables
+
+```{r include=TRUE, eval=TRUE}
+# merge survival and meta data and only keep useful columns
+meta <- meta_OG
+meta <- merge(meta, survival, by = 'path_number_short', all.x = TRUE) %>% 
+  filter(Sample_ID_short %in% colnames(cts)) %>%
+  drop_na(Sample_ID_short) %>% 
+  mutate(status = case_when(!(is.na(death_date)) ~ 1, # I am doing this case_when statement bc two patients had both death_date and Last_Follow_up
+                            TRUE ~ 0)) %>% # status == 1 means dead, status == 0 means censored 
+  mutate(fu_date = case_when(!(is.na(death_date)) ~ death_date,
+                            TRUE ~ Last_Follow_up)) %>% 
+  mutate(time = difftime(fu_date, surg_date,  units = "days")) %>%
+  dplyr::select(-c('panel','Comments','case','os_days_fromsurgery_5yearsmax','death1.censored0.5years','os_days_fromsurgery','OS.death1.censored0.','MRN','Age_surgery','Last_Follow_up','death','segment','aoi','Surgical ID','Sample_ID','CaseID','preop_tx_1','preop_tx_2')) %>%
+  mutate(etiology = case_when(etiology1 %in% c('hcv','hbv') ~ 'viral',
+                              is.na(etiology1) ~ 'NA',
+                              TRUE ~ etiology1))
+
+# only want resection or transplant samples
+meta <- meta %>% filter(sample %in% c('resection','transplant'))
+
+# create unique patient ID to remove identifiers
+meta <- meta %>%                                  
+  group_by(mrn) %>%
+  dplyr::mutate(ID = cur_group_id()) %>% 
+  ungroup()
+meta$ID <- as.factor(meta$ID)
+
+cts <- cts[,colnames(cts) %in% meta$Sample_ID_short]
+```
+
+### export patient clinical info summary
+```{r, include=TRUE, eval=TRUE}
+clin_info <- meta %>% mutate(Sex = case_when(Gender_1M_2F==1 ~ 'M',
+                         Gender_1M_2F==2 ~ 'F')) %>% 
+  group_by(ID, Sex, status, time, serum_afp, tbili, alb, inr, etiology, tumor_number, tumor_size, differentiation, tstage, nstage, lvi, pni, fibrosis, steatosis) %>%
+  summarise(AOI_count = n_distinct(Sample_ID_short)) %>% 
+  ungroup() 
+  
+# write.csv(clin_info,paste0(output_path,'/clinical_summary.csv'))
+```
+
+### heatmap of tumor and vessel AOIs altogether 
+
+```{r, include=TRUE, eval=TRUE}
+##### both tumor and vessel together #####
+meta_here <- meta 
+colpheno<-data.frame(meta_here %>%  
+                       dplyr::select(Tissue_Type),
+                     row.names=meta_here$Sample_ID_short)
+rowPheno<-data.frame('Hoshida_type' = 
+                       case_when(rownames(cts) %in% HoshidaGenes[HoshidaGenes$Set=='1',]$Genes ~ 'S1',
+                                 rownames(cts) %in% HoshidaGenes[HoshidaGenes$Set=='2',]$Genes ~ 'S2',
+                                 rownames(cts) %in% HoshidaGenes[HoshidaGenes$Set=='3',]$Genes ~ 'S3',
+                                 TRUE ~ 'Others'))
+rownames(rowPheno) <- rownames(cts)
+
+cts_here <- cts[,colnames(cts) %in% meta_here$Sample_ID_short]
+cts_here <- t(scale(t(log2(cts_here)), scale = F)) # normalize by gene
+
+topGenes <- 300
+clst<-bswClst.clust(cts_here,topNSdRows=topGenes, medianPolish = F, clusterRows = T, clusterCols = T)
+
+# short format
+save_path = paste0(output_path, '/GeoMx_tumor&vessel_heatmap_short_top',topGenes,'.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   colPheno=colpheno,colDendroPlot=T,colNamesTopJust=F,colNamesTopPlot=F,colPhenoColorMaps = tissue_colors,
+                   rowPheno=rowPheno,rowDendroPlot=T,rowNamesLeftJust=F,rowNamesLeftPlot=F,rowPhenoColorMaps = Hoshida_colors, 
+                   heatmapHeight='golden',
+                   heatmapAutoZlimMethod='range',
+                   legendGex=4,fontsize = 15,legendIndent = 0, legendOffset=0.3,
+                   heatmapColorRampGamma=5,heatmapRampGex=3
+                   )
+
+# long format
+save_path = paste0(output_path, '/GeoMx_tumor&vessel_heatmap_long_top',topGenes,'.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   colPheno=colpheno,colDendroPlot=T,colNamesTopJust=F,colNamesTopPlot=F,colPhenoColorMaps = tissue_colors, 
+                   rowPheno=rowPheno,rowDendroPlot=T,rowPhenoColorMaps = Hoshida_colors,rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   legendGex=4,fontsize = 15,legendIndent = 0, legendOffset=0.3,
+                   heatmapAutoZlimMethod='range',heatmapRampGex=3,
+                   heatmapColorRampGamma=5)
+
+# only selected genes
+cts_here_subset <- cts_here[rownames(cts_here) %in%
+  c('ARG1', 'APOA2', 'APOB', 'APOC2', 'CCL16', 'CRP', 'F12', 'FN1', 'IL32', 'LBP', 'OTC', 'SERPINA1', 'SOD1', 'TTR', 'VEGFA', # cancer
+    'CD34', 'CDH5', 'ENG', 'ETS', 'FLT1', 'IL33', 'JAG1', 'KDR', 'MCAM', 'NOTCH3', 'PECAM1', 'SPRY1', 'STC1', 'THY1', 'TIE1'),] # vessel
+clst<-bswClst.clust(cts_here_subset,topNSdRows=200, medianPolish = F, clusterRows = T, clusterCols = T)
+save_path = paste0(output_path, '/GeoMx_tumor&vessel_heatmap_subset.pdf')
+colpheno<-data.frame(meta_here %>%  dplyr::select(Tissue_Type) ,
+                     row.names=meta_here$Sample_ID_short)
+bswClst.plotToFile(path=save_path,clst=clst,
+                   colPheno=colpheno,colDendroPlot=T,colNamesTopJust=F,colNamesTopPlot=F,colPhenoColorMaps = tissue_colors,
+                   rowDendroPlot=T,rowPhenoColorMaps = Hoshida_colors,rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   heatmapAutoZlimMethod='range',
+                   legendGex=4,fontsize = 15,legendIndent = 0, legendOffset=0.3,heatmapRampGex=2,
+                   heatmapColorRampGamma=5)
+
+# only Hoshida genes
+rowPheno_Hoshida <- rowPheno %>% filter(Hoshida_type!='Others')
+cts_here <- cts[rownames(cts)%in% rownames(rowPheno_Hoshida),] # keep only Hoshida genes
+cts_here <- cts_here[,colnames(cts_here) %in% meta_here$Sample_ID_short] # keep only samples in meta
+cts_here <- t(scale(t(log2(cts_here)), scale = F)) # normalize by gene
+
+clst<-bswClst.clust(cts_here,topNSdRows=200, medianPolish = F, clusterRows = T, clusterCols = T)
+save_path = paste0(output_path, '/GeoMx_tumor&vessel_heatmap_Hoshida.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   colPheno=colpheno,colDendroPlot=T,colNamesTopJust=F,colNamesTopPlot=F,colPhenoColorMaps = tissue_colors, 
+                   rowPheno=rowPheno,rowDendroPlot=T,rowPhenoColorMaps = Hoshida_colors,rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   legendGex=4,fontsize = 15,legendIndent = 0, legendOffset=0.3,heatmapRampGex=2,
+                   heatmapAutoZlimMethod='range',heatmapColorRampGamma=5
+                   )
+```
+
+
+### differential expression analysis function 
+```{r}
+get_diffexp<-function(df,de,test_name){
+  # df is a counts table, after q3 normalization
+  # de is a data frame of sample names and groups to perform DE on
+  # test_name is the type of statistical test, which depends on the actual test and its associated assumptions. options are 'wilcoxon','t_test', and 'lme'
+  df <- as.data.frame(t(scale(t(log2(df)), scale = F))) # log2 transform the counts and center each gene so that they all have mean of 0
+  # mean centering should not change the test results 
+  typ<- as.factor(de[,2])
+  diffexp <- foreach(cl = levels(typ), .combine=cbind) %do% {
+    idx<-typ==cl
+    idx[is.na(idx)] <- FALSE
+    rowMeans(df[,idx],na.rm=T)
+  } # Calculate group means.
+  diffexp <- as.data.frame(diffexp)
+  colnames(diffexp) <- levels(typ)
+  test<-combn(1:ncol(diffexp),2)
+  for (n in 1:ncol(test)){
+    cn<-colnames(diffexp)
+    g1<-test[1,n]
+    g2<-test[2,n]
+    t1<-levels(typ)[g1]
+    t2<-levels(typ)[g2]
+    
+    diffexp$LFC<-diffexp[,g1] - diffexp[,g2]
+    if(test_name == 'lme'){
+      df_full <- as.data.frame(t(df[, typ %in% c(t1, t2)])) %>% rownames_to_column(var='Sample_ID_short')
+      df_full <- merge(df_full,meta[c('Sample_ID_short','ID')]) 
+      rownames(df_full) <- df_full$Sample_ID_short
+      df_full <- merge(df_full,de,by=0)
+      diffexp$p_lme <- foreach(i = 1:nrow(df), .combine=c) %do% {
+        summary(lmerTest::lmer(as.formula(paste0('`',rownames(df)[i], "`~", colnames(de)[2], "+ (1 | ID)")), data=df_full))[10]$coefficients[2,5]
+      }
+    }
+    if(test_name == 'Wilcoxon'){
+      diffexp$p<- foreach(i = 1:nrow(df), .combine=c) %do% {
+          wilcox.test(as.numeric(df[i, typ==t1]), as.numeric(df[i, typ==t2]), exact=FALSE)$p.value # Calculate Wilcoxon Rank Sum p-value
+        }
+      }
+    if(test_name == 't_test'){
+      diffexp$p <- foreach(i = 1:nrow(df), .combine=c) %do% {
+          t.test(as.numeric(df[i, typ==t1]), as.numeric(df[i, typ==t2]))$p.value # t test p-values
+        }
+    }
+    diffexp$padj<-(p.adjust(diffexp$p,method='fdr'))
+    colnames(diffexp)<-c(cn,paste0('LFC_',t1,'_',t2),paste0('p_',t1,'_',t2),
+                         paste0('padj_',t1,'_',t2))
+  }
+  return(diffexp)
+}
+```
+
+### volcano plot comparing tumor and vessel AOIs
+```{r}
+df<- cts
+de <- meta %>% dplyr::select(Sample_ID_short, Tissue_Type) %>% as.data.frame()
+rownames(de) <- de$Sample_ID_short
+df <- df[,colnames(df) %in% rownames(de)]
+de <- de[match(colnames(df), rownames(de)),]
+df <- df[,match(rownames(de),colnames(df))]
+
+colnames(df) == rownames(de)# double check
+dea<-get_diffexp(df,de,'lme')  
+
+# color by Tumor vs Vessel 
+diffexp <- dea %>% mutate(delabel = case_when((padj_Tumor_Vessel < 0.05 & LFC_Tumor_Vessel < -1) ~ 'Vessel',
+                                                  (padj_Tumor_Vessel < 0.05 & LFC_Tumor_Vessel > 1) ~ 'Tumor',
+                                                  TRUE ~ 'Neither'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$delabel != 'Neither']<-rownames(diffexp)[diffexp$delabel != 'Neither']
+
+write.csv(diffexp, paste0(output_path,'/GeoMx_Tum_vs_Vessel_dea.csv'))
+pdf(paste0(output_path,'/GeoMx_Tum_vs_Vessel_dea.pdf'))
+tmp<-ggplot(data=diffexp,aes(x=LFC_Tumor_Vessel,y=-log10(padj_Tumor_Vessel),col=delabel, label=lbl)) +
+  geom_point() +geom_label_repel(show.legend  = F) +
+  xlab(bquote(log[2]("tumor/vessel")))+
+  ylab(bquote(-log[10]("adjusted p-value")))+
+  theme_classic(base_size = 16)+
+  xlim(-3,3)+
+  scale_color_manual('DE label',values=tissue_colors$Tissue_Type) +
+  geom_vline(xintercept=c(-1,1), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray")+
+  theme(axis.text=element_text(size=15),
+      axis.title=element_text(size=15),
+      legend.title = element_text(size=15),
+      legend.text = element_text(size=15))
+print(tmp)
+dev.off()
+
+# color by Hoshida genes
+manual_size <- c(1,1,1,0.3)
+names(manual_size) <- c('S1','S2','S3','Others')
+
+diffexp <- dea %>% 
+  mutate(gene_label = case_when((rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='1',]$Genes) ~ 'S1',
+                                              (rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='2',]$Genes) ~ 'S2',
+                                              (rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='3',]$Genes) ~ 'S3',
+                                              TRUE ~ 'Others')) %>% 
+  mutate(lbl = case_when(abs(LFC_Tumor_Vessel) > 1 & padj_Tumor_Vessel < 0.05 ~ rownames(dea),
+                         TRUE ~ ''))
+
+write.csv(diffexp, paste0(output_path,'/GeoMx_Tum_vs_Vessel_dea_Hoshida.csv'))
+pdf(paste0(output_path,'/GeoMx_Tum_vs_Vessel_dea_Hoshida_color.pdf'))
+tmp<-ggplot(data=diffexp,aes(x=LFC_Tumor_Vessel,y=-log10(padj_Tumor_Vessel),col=gene_label, label=lbl)) +
+  geom_point() + theme_classic(base_size = 16) +geom_label_repel(show.legend  = F, max.overlaps = 15) +
+  xlim(-3.5, 3.5) +
+  xlab(bquote(log[2]("tumor/vessel")))+
+  ylab(bquote(-log[10]("adjusted p-value")))+
+  scale_color_manual('Hoshida set',values=c('S1'='black','S2'='dodgerblue3','S3'='forestgreen','Others'='gray')) +
+  scale_alpha_manual(values=manual_size)+
+  geom_vline(xintercept=c(-1,1), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray")+
+  guides(color = guide_legend(override.aes = list(size = 3)))+
+    theme(axis.text=element_text(size=15),
+        axis.title=element_text(size=15),
+        legend.title = element_text(size=15),
+        legend.text = element_text(size=15))+
+  theme(legend.position="bottom")
+print(tmp)
+dev.off()
+```
+
+### Deconvolution of AOIs to show tumor and vessel genes separate out
+```{r}
+library(SpatialDecon)
+colfunc <- colorRampPalette(c("white", "red")) 
+cols <- colfunc(10)
+
+Ves <- cts[colnames(cts) %in% meta[meta$Tissue_Type=='Vessel',]$Sample_ID_short]
+VMeta<-meta[which(meta$Tissue_Type=='Vessel'),]
+exp<-Ves %>% as.matrix()
+bg<-derive_GeoMx_background(norm=exp,probepool=rep(1,nrow(exp)),
+                            negnames='Negative Probe')
+dec<-spatialdecon(norm=exp,bg=bg)
+clst<-bswClst.clust(dec$prop_of_all,medianPolish=F)
+colpheno<-data.frame(VMeta %>%  dplyr::select(ID) ,
+                     row.names=VMeta$Sample_ID_short)
+bswClst.plotToFile(paste0(output_path,'/EndoDecon.pdf'),clst=clst,
+                   colPheno=colpheno,
+                   # heatmapAutoZlimMethod='range',
+                   heatmapZlim = c(0,1),
+                   heatmapColorRamp = cols)
+write.table(dec$prop_of_all,paste0(output_path,'/EndoDeconProp.tsv'),sep='\t',quote=F)
+
+##### tumor #####
+Tum <- cts[colnames(cts) %in% meta[meta$Tissue_Type=='Tumor',]$Sample_ID_short]
+TMeta<-meta[which(meta$Tissue_Type=='Tumor'),]
+exp<-Tum %>% as.matrix()
+bg<-derive_GeoMx_background(norm=exp,probepool=rep(1,nrow(exp)),
+                            negnames='Negative Probe')
+dec<-spatialdecon(norm=exp,bg=bg)
+clst<-bswClst.clust(dec$prop_of_all,medianPolish=F)
+colpheno<-data.frame(TMeta %>%  dplyr::select(ID) ,
+                     row.names=TMeta$Sample_ID_short)
+bswClst.plotToFile(paste0(output_path,'/EpiDecon.pdf'),clst=clst,
+                   colPheno=colpheno,
+                   heatmapZlim = c(0,1),
+                   heatmapColorRamp = cols)
+write.table(dec$prop_of_all,paste0(output_path,'/EpiDeconProp.tsv'),sep='\t',quote=F)
+```
+
+### heatmap of Tumor AOIs to find clusters
+```{r}
+matching_aoi<-meta %>% 
+  filter(Tissue_Type %in% c('Tumor','Vessel')) %>%
+  group_by(`slide name`,roi) %>% 
+  dplyr::mutate(count = n_distinct(Tissue_Type)) %>%
+  filter(count == 2) %>%
+  dplyr::select(Sample_ID_short, `slide name`, roi, Pool, Tissue_Type, ID, etiology) %>%
+  spread(Tissue_Type,Sample_ID_short)
+
+##### tumor only #####
+meta_here <- meta %>% filter(Tissue_Type=='Tumor') %>% filter(Sample_ID_short %in% matching_aoi$Tumor)
+colpheno<-data.frame(meta_here %>%  dplyr::select(tstage, fibrosis, ID,
+                                                  # Pool,'slide name','scan name',
+                                                  etiology),
+                     row.names=meta_here$Sample_ID_short)
+
+cts_here <- cts[,colnames(cts) %in% meta_here$Sample_ID_short]
+cts_here <- t(scale(t(log2(cts_here)), scale = F)) # log transform, center by gene, keep variance
+
+topGenes <- 100
+clst<-bswClst.clust(cts_here,topNSdRows=topGenes, medianPolish = T, clusterRows = T, clusterCols = T)
+
+# cut tree
+cto <- bswClst.cutree2(clst$dc, k = 3)
+
+tumor_clst1 <- cto$leaveLabs[[1]]
+tumor_clst2 <- cto$leaveLabs[[2]]
+tumor_clst3 <- cto$leaveLabs[[3]]
+colpheno <- colpheno %>% 
+  mutate(subtype = case_when(rownames(colpheno) %in% tumor_clst1 ~ 'T1',
+                                     rownames(colpheno) %in% tumor_clst2 ~ 'T2',
+                                     rownames(colpheno) %in% tumor_clst3 ~ 'T3',
+                                 TRUE ~ 'Others'))
+# long format
+save_path = paste0(output_path, '/GeoMx_tumor_heatmap_long_top',topGenes,'.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   colPheno=colpheno,colDendroPlot=T,colPhenoColorMaps = c(T1T2T3_colors,tstage_colors,fibrosis_colors),
+                   rowDendroPlot=T,rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   gex=0.2,
+                   heatmapAutoZlimMethod='range',
+                   heatmapColorRampGamma=3)
+```
+
+
+### find tumor and vessel niches and representative genes
+```{r}
+# dea among T1, T2, T3
+df<- Tum
+de <- data.frame(matching_aoi %>% mutate(Niche = case_when(Tumor %in% tumor_clst1 ~ 'T1',
+                                                Tumor %in% tumor_clst2 ~ 'T2',
+                                                Tumor %in% tumor_clst3 ~ 'T3'
+                                                )) %>% 
+  ungroup() %>% 
+  filter(!is.na(Niche)) %>% 
+  dplyr::select(Tumor, Niche))
+rownames(de) <- de$Tumor
+df <- df[,colnames(df) %in% rownames(de)]
+de <- de[match(colnames(df), rownames(de)),]
+df <- df[,match(rownames(de),colnames(df))]
+
+colnames(df) == rownames(de)# double check
+dea<-get_diffexp(df,de,'Wilcoxon')  
+
+LFC_thres <- 1
+
+clust1_Tum_genes_all <- dea %>% filter(padj_T1_T2 < 0.05 & LFC_T1_T2 > LFC_thres | padj_T1_T3 < 0.05 & LFC_T1_T3 > LFC_thres) %>% rownames()
+clust2_Tum_genes_all <- dea %>% filter(padj_T1_T2 < 0.05 & LFC_T1_T2 < -LFC_thres | padj_T2_T3 < 0.05 & LFC_T2_T3 > LFC_thres) %>% rownames()
+clust3_Tum_genes_all <- dea %>% filter(padj_T1_T3 < 0.05 & LFC_T1_T3 < -LFC_thres | padj_T2_T3 < 0.05 & LFC_T2_T3 < -LFC_thres) %>% rownames()
+# remove if element exists in another list
+clust1_Tum_genes <- setdiff(setdiff(clust1_Tum_genes_all, clust2_Tum_genes_all),clust3_Tum_genes_all)
+clust2_Tum_genes <- setdiff(setdiff(clust2_Tum_genes_all, clust1_Tum_genes_all),clust3_Tum_genes_all)
+clust3_Tum_genes <- setdiff(setdiff(clust3_Tum_genes_all, clust1_Tum_genes_all),clust2_Tum_genes_all)
+
+##### heatmap of just the T1T2T3 genes and corresponding AOIs ##### 
+meta_here <- meta %>% filter(Tissue_Type=='Tumor')
+colpheno<-data.frame(meta_here %>%  dplyr::select(etiology, tstage, 
+                                                  # 'slide name', Pool,# sanity check ones
+                                                  fibrosis,ID), row.names=meta_here$Sample_ID_short)
+colpheno <- colpheno %>% 
+  mutate(subtype = case_when(rownames(colpheno) %in% tumor_clst1 ~ 'T1',
+                                     rownames(colpheno) %in% tumor_clst2 ~ 'T2',
+                                     rownames(colpheno) %in% tumor_clst3 ~ 'T3',
+                                 TRUE ~ 'Others'))
+rowPheno<-data.frame('subtype' = 
+                       case_when(rownames(cts) %in% clust1_Tum_genes ~ 'T1',
+                                 rownames(cts) %in% clust2_Tum_genes ~ 'T2',
+                                 rownames(cts) %in% clust3_Tum_genes ~ 'T3',
+                                 TRUE ~ 'Others')) 
+rownames(rowPheno) <- rownames(cts)
+rowPheno <- rowPheno %>% filter(subtype!='Others') %>% arrange(subtype)
+cts_here <- cts[rownames(cts) %in% c(clust1_Tum_genes,clust2_Tum_genes,clust3_Tum_genes),] # keep only T1T2T3 genes
+cts_here <- cts_here[,colnames(cts_here) %in% meta_here$Sample_ID_short] # keep only samples in meta
+cts_here <- t(scale(t(log2(cts_here)), scale = F)) # normalize by gene
+cts_here <- cts_here[match(rownames(rowPheno), rownames(cts_here)), match(c(tumor_clst1,tumor_clst2,tumor_clst3), colnames(cts_here))] # order by AOIs that define T1T2T3
+
+clst<-bswClst.clust(cts_here,medianPolish = F, clusterRows = F, clusterCols = F)
+save_path = paste0(output_path, '/GeoMx_tumor_heatmap_T1T2T3.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,colPheno=colpheno,
+                   rowPheno=rowPheno,
+                   rowDendroPlot=T,colDendroPlot=T,
+                   rowPhenoColorMaps = T1T2T3_colors, 
+                   colPhenoColorMaps = c(tstage_colors,fibrosis_colors,T1T2T3_colors), 
+                   rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   gex=0.2,
+                   heatmapAutoZlimMethod='range',
+                   heatmapColorRampGamma=5)
+
+##### volcano plot #####
+diffexp <- dea %>% mutate(delabel = case_when((padj_T1_T2 < 0.05 & LFC_T1_T2 < -LFC_thres) ~ 'T2',
+                                                  (padj_T1_T2 < 0.05 & LFC_T1_T2 > LFC_thres) ~ 'T1',
+                                                  TRUE ~ 'Neither'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$delabel != 'Neither']<-rownames(diffexp)[diffexp$delabel != 'Neither']
+write.csv(diffexp, paste0(output_path,'/dea_T1_T2.csv'))
+pdf(paste0(output_path,'/Niche_Comp_Volcano.pdf'))
+tmp<-ggplot(data=diffexp,aes(x=LFC_T1_T2,y=-log10(padj_T1_T2),col=delabel, label=lbl)) +
+  geom_point() + theme_classic() +geom_text_repel() +
+  scale_color_manual('subtype',values=T1T2T3_colors$subtype) +
+  labs(title='T1 vs T2 AOIs ', 
+       x = bquote(log[2]('T1/T2')),
+       y = bquote(-log[10]('adjusted p-value'))) + 
+  geom_vline(xintercept=c(-LFC_thres,LFC_thres), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray") +
+  guides(color = guide_legend(override.aes = list(size = 3,shape=19)))+
+  theme(axis.text=element_text(size=15),
+      axis.title=element_text(size=15),
+      legend.title = element_text(size=15),
+      legend.text = element_text(size=15))
+
+print(tmp)
+
+# T1 vs T3
+myCol=c('black','green','grey')
+names(myCol)<-c('T1','T3','Neither')
+
+diffexp <- dea %>% mutate(delabel = case_when((padj_T1_T3< 0.05 & LFC_T1_T3 < -LFC_thres) ~ 'T3',
+                                                  (padj_T1_T3< 0.05 & LFC_T1_T3 > LFC_thres) ~ 'T1',
+                                                  TRUE ~ 'Neither'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$delabel != 'Neither']<-rownames(diffexp)[diffexp$delabel != 'Neither']
+write.csv(diffexp, paste0(output_path,'/dea_T1_T3.csv'))
+tmp<-ggplot(data=diffexp,aes(x=LFC_T1_T3,y=-log10(padj_T1_T3),col=delabel, label=lbl)) +
+  geom_point() + theme_classic() +geom_text_repel() +
+  scale_color_manual('subtype',values=T1T2T3_colors$subtype) +
+  labs(title='T1 vs T3 AOIs ', 
+      x = bquote(log[2]('T1/T3')),
+      y = bquote(-log[10]('adjusted p-value'))) + 
+  geom_vline(xintercept=c(-LFC_thres,LFC_thres), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray")+
+  guides(color = guide_legend(override.aes = list(size = 3, shape=19)))+
+  theme(axis.text=element_text(size=15),
+      axis.title=element_text(size=15),
+      legend.title = element_text(size=15),
+      legend.text = element_text(size=15))
+print(tmp)
+
+# T2 vs T3
+myCol=c('blue','green','grey')
+names(myCol)<-c('T2','T3','Neither')
+
+diffexp <- dea %>% mutate(delabel = case_when((padj_T2_T3< 0.05 & LFC_T2_T3 < -LFC_thres) ~ 'T3',
+                                                  (padj_T2_T3< 0.05 & LFC_T2_T3 > LFC_thres) ~ 'T2',
+                                                  TRUE ~ 'Neither'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$delabel != 'Neither']<-rownames(diffexp)[diffexp$delabel != 'Neither']
+write.csv(diffexp, paste0(output_path,'/dea_T2_T3.csv'))
+tmp<-ggplot(data=diffexp,aes(x=LFC_T2_T3,y=-log10(padj_T2_T3),col=delabel, label=lbl)) +
+  geom_point() + theme_classic() +geom_text_repel() +
+  scale_color_manual('subtype',values=T1T2T3_colors$subtype) +
+  labs(title='T2 vs T3 AOIs ', 
+      x = bquote(log[2]('T2/T3')),
+      y = bquote(-log[10]('adjusted p-value'))) + 
+  geom_vline(xintercept=c(-LFC_thres,LFC_thres), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray")+
+  guides(color = guide_legend(override.aes = list(size = 3, shape=19)))+
+  theme(axis.text=element_text(size=15),
+      axis.title=element_text(size=15),
+      legend.title = element_text(size=15),
+      legend.text = element_text(size=15))
+print(tmp)
+dev.off()
+```
+### CCA 
+```{r}
+##### Canonical correlation analysis #####
+Ves<-cts[,matching_aoi$Vessel]
+Tum<-cts[,matching_aoi$Tumor]
+topNGenes<-100
+
+# extra QC:
+# pre-filter out vessel genes if a gene is highly correlated with the same gene in tumor 
+# corr_thres <- 0.6
+# ves_gene_remove <- c()
+# for(gene in rownames(Ves)){
+#   # print(gene)
+#   if(cor(as.numeric(Tum[gene,]),as.numeric(Ves[gene,]))>corr_thres){
+#     ves_gene_remove <- c(ves_gene_remove,gene)
+#     }
+# }
+# Ves <- Ves[!rownames(Ves) %in% ves_gene_remove,]
+
+
+VesSd<-rowSds(as.matrix(Ves))
+names(VesSd)<-rownames(Ves)
+VesCov<-VesSd/rowMeans(as.matrix(Ves))
+# hist(VesCov)
+VesGene<-names(VesCov)[order(VesCov,decreasing=T)[1:topNGenes]]
+
+TumSd<-rowSds(as.matrix(Tum))
+names(TumSd)<-rownames(Tum)
+TumCov<-TumSd/rowMeans(as.matrix(Tum))
+TumGene<-names(TumCov)[order(TumCov,decreasing=T)[1:topNGenes]]
+
+# # normalize by genes
+# Ves_centered <- t(scale(t(log2(Ves[VesGene,])), scale = F)) # center by gene, keep variance
+# Tum_centered <- t(scale(t(log2(Tum[TumGene,])), scale = F)) # center by gene, keep variance
+
+# standardize
+Ves_centered <- t(scale(t(log2(Ves[VesGene,])), scale = T)) # center and standardize by gene in log scale
+Tum_centered <- t(scale(t(log2(Tum[TumGene,])), scale = T)) # center and standardize by gene in log scale
+
+X<-as.data.frame(t(as.matrix(Tum_centered)))
+Y<-as.data.frame(t(as.matrix(Ves_centered)))
+colnames(X) <- paste(colnames(X),"Tum",sep="_")
+colnames(Y) <- paste(colnames(Y),"Ves",sep="_")
+
+# shrinkage
+rcca_GeoMx_shrinkage <- rcc(X, Y, method = 'shrinkage')
+# examine the optimal lambda values after shrinkage 
+rcca_GeoMx_shrinkage$lambda 
+
+# https://github.com/mixOmicsTeam/mixOmics/blob/master/R/plotVar.R line 305
+coord.X= cor(rcca_GeoMx_shrinkage$X, rcca_GeoMx_shrinkage$variates$X + rcca_GeoMx_shrinkage$variates$Y, use = "pairwise")
+coord.Y = cor(rcca_GeoMx_shrinkage$Y, rcca_GeoMx_shrinkage$variates$X + rcca_GeoMx_shrinkage$variates$Y, use = "pairwise")
+coord <- rbind(data.frame(coord.X) %>% mutate(tissue='Tumor'), data.frame(coord.Y) %>% mutate(tissue='Vessel'))
+coord$gene <- rownames(coord)
+
+# annotate by T1/T2/T3
+coord <- coord %>% mutate(subtype = case_when(tissue=='Tumor' & gene %in% paste(clust1_Tum_genes, "_Tum", sep="") ~ 'T1',
+                                              tissue=='Tumor' & gene %in% paste(clust2_Tum_genes, "_Tum", sep="")  ~ 'T2',
+                                              tissue=='Tumor' & gene %in% paste(clust3_Tum_genes, "_Tum", sep="")  ~ 'T3',
+                                              TRUE ~ tissue))
+colors <- c("T1" = "black", "T2" = "blue", "T3" = "darkolivegreen4", 
+            'Vessel' = 'pink', 'Tumor' = 'grey')
+
+coord <- coord %>% mutate(label = case_when(subtype %in% c('T1','T2','T3','V1','V2','V3') ~ gene,
+                                           TRUE ~ ''))
+
+T1T2T3_plot <- coord %>%
+  ggplot(aes(x=X1,y=X2,label=label,color=subtype)) +
+  geom_point(size=0.5, alpha = 1) +
+  scale_color_manual(values = colors)+
+  xlim(-1, 1) + ylim(-1,1) + theme_classic() +
+  geom_circle(aes(x0 = 0, y0 = 0, r = 0.5), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  geom_circle(aes(x0 = 0, y0 = 0, r = 1), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  coord_fixed() +
+  geom_label_repel(size=1.5, segment.size	=0.15, max.overlaps = Inf,
+                  segment.curvature = -0.1, segment.ncp = 3,segment.angle = 20, show.legend=F)+
+  labs(title="CCA variable plot between tumor and vessel AOIs",
+        x ="Canonical Component 1", y = "Canonical Component 2")+
+  guides(color = guide_legend(override.aes = list(size = 3)))+
+  theme(legend.position="bottom")
+
+# select genes
+coord_select <- coord %>% mutate(label = case_when(gene %in% c('APOA2_Tum','IDH1_Ves','HSPB1_Tum','CXCL12_Tum','CCL21_Ves','CCL19_Ves','CD24_Tum','SPP1_Ves','CXCL2_Tum') ~ gene,
+                                           TRUE ~ ''))
+
+variable_plot_select <- coord_select %>%
+  ggplot(aes(x=X1,y=X2,label=label,color=subtype)) +
+  geom_point(size=2, alpha = 0.8) +
+  scale_color_manual(values = colors)+
+  xlim(-1, 1) + ylim(-1,1) + theme_classic() +
+  geom_circle(aes(x0 = 0, y0 = 0, r = 0.5), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  geom_circle(aes(x0 = 0, y0 = 0, r = 1), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  coord_fixed() +
+  geom_label_repel(size=5, segment.size	=0.15, max.overlaps = Inf,
+                  segment.curvature = -0.1, segment.ncp = 3,segment.angle = 20, show.legend=F)+
+  labs(x ="Canonical Component 1", y = "Canonical Component 2")+
+  guides(color = guide_legend(override.aes = list(size = 3)))+
+  theme(axis.text=element_text(size=15),
+        axis.title=element_text(size=15),
+        legend.text = element_text(size=15),
+        legend.title = element_text(size=15),
+        legend.position="bottom")
+
+# more genes
+coord_full <- coord %>% mutate(label = case_when(subtype %in% c('T1','T2','T3','V1','V2','V3') ~ gene,
+                                            X1^2+X2^2>0.25 ~ gene,
+                                           TRUE ~ ''))
+
+variable_plot_full <- coord_full %>%
+  ggplot(aes(x=X1,y=X2,label=label,color=subtype)) +
+  geom_point(size=0.5, alpha = 1) +
+  scale_color_manual(values = colors)+
+  xlim(-1, 1) + ylim(-1,1) + theme_classic() +
+  geom_circle(aes(x0 = 0, y0 = 0, r = 0.5), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  geom_circle(aes(x0 = 0, y0 = 0, r = 1), linetype=2, alpha=0.2, colour = 'grey', inherit.aes = FALSE) + 
+  coord_fixed() +
+  geom_label_repel(size=1.5, segment.size	=0.15, max.overlaps = Inf,
+                  segment.curvature = -0.1, segment.ncp = 3,segment.angle = 20, show.legend=F)+
+  labs(x ="Canonical Component 1", y = "Canonical Component 2")+
+  guides(color = guide_legend(override.aes = list(size = 3)))+
+  theme(legend.position="bottom")
+
+# individual pair correlations
+XY <- cbind(X,Y)
+CCA_gene_comp <- function(gene1,gene2,title){
+  p <- ggplot(data = XY, aes_string(x=gene1, y=gene2)) +
+      geom_point(size=2,alpha=0.8)+
+      theme_classic()+
+      theme(axis.title=element_text(size=30))+
+    stat_poly_line() +
+    stat_cor(method = "pearson",size=10)
+    # ggtitle(paste0(gene1,' vs ',gene2))
+  print(p)
+}
+
+pdf(paste0(output_path,'/CCA_plots.pdf'))
+print(T1T2T3_plot)
+print(variable_plot_select)
+print(variable_plot_full)
+CCA_gene_comp('HSPB1_Tum','IDH1_Ves') # Niche 1 metabolic gene in vessel, heatshock protein in tumor
+CCA_gene_comp('APOA2_Tum','IDH1_Ves') # Niche 1 stem/progenitor 
+CCA_gene_comp('CXCL12_Tum','CCL21_Ves') # Niche 2 
+CCA_gene_comp('CXCL12_Tum','CCL19_Ves') # Niche 2 
+CCA_gene_comp('CD24_Tum','SPP1_Ves') # 
+CCA_gene_comp('SPINK1_Tum','SPP1_Ves') # 
+CCA_gene_comp('G6PD_Tum','ALDOA_Tum') # 
+CCA_gene_comp('CXCL2_Tum','IDH1_Ves') # 
+CCA_gene_comp('HSPB1_Tum','IDH1_Ves') # 
+CCA_gene_comp('APOA2_Tum','APOB_Ves') # 
+CCA_gene_comp('LYZ_Tum','IDH1_Ves') # 
+
+dev.off()
+```
+### correlate ROI Hoshida types with vascularization 
+```{r}
+S1_genes_in_cts <- intersect(HoshidaGenes$Genes[HoshidaGenes$Set==1],rownames(cts))
+S2_genes_in_cts <- intersect(HoshidaGenes$Genes[HoshidaGenes$Set==2],rownames(cts))
+S3_genes_in_cts <- intersect(HoshidaGenes$Genes[HoshidaGenes$Set==3],rownames(cts))
+raw_cts <- read.delim(paste0(data_path,'/rawCounts.tsv')) # generated using NS workflow script
+
+# shorten sample names
+colnames(raw_cts) <- gsub('\\.','-',colnames(raw_cts))
+colnames(raw_cts) <- gsub('.dcc','',colnames(raw_cts))
+colnames(raw_cts) <- gsub('DSP-100166000','',colnames(raw_cts))
+
+# these are vessel AOIs. so as to keep rownames and df structure
+raw_cts_roi <- raw_cts[,c('6330-C-E05','5957-A-A03')] 
+
+# combine counts from tumor and vessel in the same ROI to simulate bulk sequencing
+for (tum in matching_aoi$Tumor){
+  ves <- matching_aoi[matching_aoi$Tumor==tum,]$Vessel
+  per_roi <- data.frame(rowSums(raw_cts[,c(tum, ves)]))
+  colnames(per_roi) = tum
+  raw_cts_roi <- cbind(raw_cts_roi, per_roi)
+}
+
+# drop the vessel AOIs now
+raw_cts_roi <- raw_cts_roi[,!names(raw_cts_roi) %in% c('6330-C-E05','5957-A-A03')]
+
+# log and mean center quantile normalized data -> each gene has mean 0
+raw_cts_roi_centered <- t(scale(log(t(raw_cts_roi+1)), center = T, scale = F))
+
+Hoshida_dominant <- data.frame(matrix(ncol = 2, nrow = 1))
+colnames(Hoshida_dominant) <-c('Tumor','Hoshida_type')
+
+for (tum_AOI in colnames(raw_cts_roi)){
+  S1_ratio <- mean(raw_cts_roi_centered[rownames(raw_cts_roi_centered) %in% S1_genes_in_cts,tum_AOI])
+  S2_ratio <- mean(raw_cts_roi_centered[rownames(raw_cts_roi_centered) %in% S2_genes_in_cts,tum_AOI])
+  S3_ratio <- mean(raw_cts_roi_centered[rownames(raw_cts_roi_centered) %in% S3_genes_in_cts,tum_AOI])
+  Hoshida_dominant <- rbind(Hoshida_dominant, c(tum_AOI, paste0('S',which.max(c(S1_ratio,S2_ratio,S3_ratio)))))
+}
+
+Hoshida_dominant <- Hoshida_dominant[2:nrow(Hoshida_dominant),]
+
+Hoshida_dominant %>% group_by(Hoshida_type) %>% tally() # by ROI
+
+##### plot relationship between S1/S2/S3 and vascularization #####
+AOI_areas <- meta %>% dplyr::select(Sample_ID_short, area)
+vascularization <- merge(AOI_areas, matching_aoi[c('Tumor','Vessel')], by.x = 'Sample_ID_short', by.y='Tumor')
+colnames(vascularization) <- c('Tumor','Tumor_area','Vessel')
+vascularization <- merge(AOI_areas, vascularization, by.x = 'Sample_ID_short', by.y = 'Vessel')
+colnames(vascularization) <- c('Vessel','Vessel_area','Tumor','Tumor_area')
+vascularization <- vascularization %>% mutate(ves_perc = 100* Vessel_area/ (Vessel_area+Tumor_area))
+
+# vascularization <- merge(Hoshida_dominant, vascularization, by = c('Tumor','Vessel'))
+vascularization <- merge(Hoshida_dominant, vascularization, by = c('Tumor'))
+vascularization <- merge(vascularization, meta[c('Sample_ID_short','ID')], by.x = 'Tumor', by.y='Sample_ID_short')
+
+pdf(paste0(output_path,'/GeoMx_vasc_Hoshida.pdf'))
+my_comparisons <- list( c("S1", "S2"), c("S2", "S3"), c("S1", "S3"))
+vascularization %>%
+  ggplot(aes(fill=Hoshida_type, y=ves_perc, x=Hoshida_type)) + 
+    geom_boxplot(position="dodge", width=0.5, alpha=0.7) +
+    theme_classic()+
+    scale_fill_manual(values=Hoshida_colors$Hoshida_type[1:3])+
+    xlab("Hoshida type for ROIs") +
+    ylab("Vessel area percentage (%)") + 
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=20),
+          legend.position='none')+
+    stat_compare_means(comparisons = my_comparisons,size = 8)  # Add pairwise comparisons p-value
+dev.off()
+```
+### vascularization and cancer gene expression
+```{r}
+lm_res <- data.frame(matrix(nrow=0, ncol=4))
+colnames(lm_res) <- c('gene','slope','adj.r.squared','pval')
+for (tum_gene in rownames(Tum)){
+  # Tum_subdf <- data.frame(Tum_centered[tum_gene,]) %>% rownames_to_column('Tumor') # gene normalized cts
+  Tum_subdf <- data.frame(as.matrix(log2(Tum))[tum_gene,]) %>% rownames_to_column('Tumor') # q3 normalized cts
+  colnames(Tum_subdf) <- c('Tumor','exp')
+  Tum_subdf <- merge(Tum_subdf, vascularization[c('Tumor','ves_perc')])
+  lm_ves <- lm(exp ~ ves_perc, data = Tum_subdf)
+  lm_res[nrow(lm_res)+1,] <- c(tum_gene, summary(lm_ves)$coefficients[2,1], summary(lm_ves)$adj.r.squared, summary(lm_ves)$coefficients[2,4])
+}
+lm_res$slope <- as.numeric(lm_res$slope)
+lm_res$adj.r.squared <- as.numeric(lm_res$adj.r.squared)
+lm_res$pval <- as.numeric(lm_res$pval)
+T1 <- data.frame(Genes = clust1_Tum_genes, Set = 'T1')
+T2 <- data.frame(Genes = clust2_Tum_genes, Set = 'T2')
+T3 <- data.frame(Genes = clust3_Tum_genes, Set = 'T3')
+T1T2T3 <- rbind(T1,T2,T3)
+
+lm_res <- lm_res %>% mutate(subtype = case_when(gene %in% T1T2T3[T1T2T3$Set=='T1',]$Genes ~ 'T1',
+                                              gene %in% T1T2T3[T1T2T3$Set=='T2',]$Genes ~ 'T2',
+                                              gene %in% T1T2T3[T1T2T3$Set=='T3',]$Genes ~ 'T3'))
+lm_res$label <- with(lm_res, ifelse(pval < 0.05 & abs(slope) > 0.02, gene, ''))
+lm_res <- lm_res %>% mutate(label = case_when(#!is.na(subtype) ~ gene,
+                                              pval < 0.05 & abs(slope) > 0.025 ~ gene,
+                                              TRUE ~ ''))
+
+pdf(paste0(output_path,'/lm_ves_exp_volcano.pdf'))
+p <- lm_res %>% ggplot(aes(x=slope,y=-log(pval),label=label,color=subtype, size = adj.r.squared)) +
+  scale_color_manual(values = T1T2T3_colors$subtype) +
+  geom_point(alpha=0.5) +
+  theme_classic() + 
+  geom_label_repel(size=5, max.overlaps = 200,show.legend  = F) + 
+  geom_vline(xintercept = 0.025, linetype="dotted", color = "grey", size=.5) +
+  geom_vline(xintercept = -0.025, linetype="dotted", color = "grey", size=.5) +
+  geom_hline(yintercept = -log(0.05), linetype="dotted", color = "grey", size=.5) +
+  xlab("effect size")+ ylab(bquote(-log[10]("p-value")))+
+  scale_size_continuous(breaks = c(0.05,0.15,0.25))+
+  guides(color = guide_legend(override.aes = list(size = 3,shape=19)))+
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=20),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20),
+        legend.position = 'right')
+print(p)
+
+vasc_gene_comp <- function(tum_gene){
+  Tum_subdf <- data.frame(t(log2(Tum[tum_gene,]))) %>% rownames_to_column('Tumor') 
+  colnames(Tum_subdf) <- c('Tumor','exp')
+  Tum_subdf <- merge(Tum_subdf, vascularization[c('Tumor','ves_perc')])
+  Tum_subdf <- Tum_subdf %>% mutate(subtype = case_when(Tumor %in% tumor_clst1 ~ 'T1',Tumor %in% tumor_clst2 ~ 'T2',Tumor %in% tumor_clst3 ~ 'T3'))
+  lm_ves <- lm(exp ~ ves_perc, data = Tum_subdf)
+  p <- Tum_subdf %>% ggplot(aes(x=ves_perc,y=exp,col=subtype)) + 
+    geom_point(size=3)+theme_classic()+
+    stat_poly_line(aes(colour=NA)) +
+    stat_cor(aes(colour=NA),method = "pearson",size=10)+
+    scale_color_manual('AOI type',values=T1T2T3_colors$subtype)+
+    ggtitle(tum_gene)+
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=20),
+          title = element_text(size=25),
+          legend.title = element_text(size=20),
+          legend.text = element_text(size=20),
+          legend.position="bottom")+
+    guides(color = guide_legend(override.aes = list(size = 5,shape=16,label = "")))+
+    xlab("vessel area fraction (%)") + 
+    ylab(paste0(tum_gene," in tumor AOIs"))
+  print(p)
+}
+
+vasc_gene_comp('PCK1')
+vasc_gene_comp('SPINK1')
+vasc_gene_comp('C1R')
+vasc_gene_comp('IL6ST')
+vasc_gene_comp('MBNL3')
+vasc_gene_comp('MDM2')
+vasc_gene_comp('G6PD')
+vasc_gene_comp('C8B')
+vasc_gene_comp('EPCAM')
+vasc_gene_comp('SOD2')
+vasc_gene_comp('CXCL12')
+
+dev.off()
+```
+
+
+### add vascularization to heatmap
+```{r}
+meta_here <- meta %>% filter(Tissue_Type=='Tumor') %>% filter(Sample_ID_short %in% matching_aoi$Tumor)
+colpheno<-data.frame(meta_here %>%  dplyr::select(etiology, tstage, fibrosis,ID,tumor_size,differentiation), row.names=meta_here$Sample_ID_short)
+colpheno$Tumor <- rownames(colpheno)
+colpheno<-merge(colpheno,vascularization[c('Tumor','Hoshida_type','ves_perc')],by = 'Tumor')
+colpheno <- colpheno %>% column_to_rownames(var="Tumor")
+colpheno$tumor_size <- as.numeric(colpheno$tumor_size)
+
+colpheno <- colpheno %>% 
+  mutate(subtype = case_when(rownames(colpheno) %in% tumor_clst1 ~ 'T1',
+                                     rownames(colpheno) %in% tumor_clst2 ~ 'T2',
+                                     rownames(colpheno) %in% tumor_clst3 ~ 'T3',
+                                 TRUE ~ 'Others'))
+# only showing a few 
+colPheno <- colpheno %>% dplyr::select(Hoshida_type,ves_perc,subtype)
+
+rowPheno<-data.frame('subtype' = 
+                       case_when(rownames(cts) %in% clust1_Tum_genes ~ 'T1',
+                                 rownames(cts) %in% clust2_Tum_genes ~ 'T2',
+                                 rownames(cts) %in% clust3_Tum_genes ~ 'T3',
+                                 TRUE ~ 'Others')) 
+rownames(rowPheno) <- rownames(cts)
+rowPheno <- rowPheno %>% filter(subtype!='Others') %>% arrange(subtype)
+colnames(rowPheno) <- 'gene type'
+colnames(colPheno) <- c('ROI Hoshida type','vessel fraction','AOI subtype')
+cts_here <- cts[rownames(cts) %in% c(clust1_Tum_genes,clust2_Tum_genes,clust3_Tum_genes),] # keep only T1T2T3 genes
+cts_here <- cts_here[,colnames(cts_here) %in% meta_here$Sample_ID_short] # keep only samples in meta
+cts_here <- t(scale(t(log2(cts_here)), scale = F)) # normalize by gene
+cts_here <- cts_here[match(rownames(rowPheno), rownames(cts_here)), match(c(tumor_clst1,tumor_clst2,tumor_clst3), colnames(cts_here))] # order by AOIs that define T1T2T3
+
+clst<-bswClst.clust(cts_here,medianPolish = F, clusterRows = F, clusterCols = F)
+save_path = paste0(output_path, '/GeoMx_tumor_heatmap_T1T2T3.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   rowPheno=rowPheno,rowDendroPlot=T,rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   rowPhenoColorMaps = list('gene type'=c('T1'='black','T2'='blue','T3'='forestgreen','Others'='lightgrey')), 
+                   colPheno=colPheno,colNamesTopJust=F,colNamesTopPlot=F,
+                   colPhenoColorMaps=c(list('ROI Hoshida type'=c('S1'='black','S2'='dodgerblue3','S3'='green','Others'='ghostwhite')),
+                                       list('AOI subtype'=c('T1'='black','T2'='blue','T3'='forestgreen','Others'='lightgrey'))),
+                   colDendroPlot=T,
+                   gex=0.2,legendGex=2,legendIndent = 0,heatmapRampGex=2,legendOffset=0.2,margin=0.5,
+                   heatmapAutoZlimMethod='range',
+                   heatmapColorRampGamma=5,heatmapRampOffset=-0.5)
+```
+
+### load scAtlasLC
+```{r}
+scAtlasLC_pwd <- paste0(data_path,'/scAtlasLC/')
+scAtlasLC <- ReadMtx(mtx=paste0(scAtlasLC_pwd, 'matrix.mtx.gz'), 
+                     cells = paste0(scAtlasLC_pwd, 'barcodes.tsv.gz'),
+                     features = paste0(scAtlasLC_pwd, 'features.tsv.gz')) 
+sparsity <- length(scAtlasLC@x) / scAtlasLC@Dim[1] / scAtlasLC@Dim[2]
+sparsity
+
+scAtlasLC_info <- read.csv(paste0(scAtlasLC_pwd,'GSE151530_Info.txt'), sep = '\t') 
+
+genes_overlap <- intersect(rownames(scAtlasLC), HoshidaGenes$Genes)
+
+HCC_TECs_scAtlas <- scAtlasLC_info %>% 
+  filter(Type == 'TECs') %>% 
+  filter(str_detect(Sample, "H")) 
+
+HCC_cancer_scAtlas <- scAtlasLC_info %>% 
+  filter(Type == 'Malignant cells') %>% 
+  filter(str_detect(Sample, "H"))
+
+HCC_TECs_cts <- scAtlasLC[,colnames(scAtlasLC) %in% HCC_TECs_scAtlas$Cell] %>% as.data.frame() %>% 
+  rownames_to_column('Gene')
+
+HCC_cancer_scAtlas_cts <- scAtlasLC[,colnames(scAtlasLC) %in% HCC_cancer_scAtlas$Cell] %>% as.data.frame() %>% 
+  rownames_to_column('Gene')
+
+# for each sample, sum up the counts across tumor cells and also across TECs
+cts_sc2bulk <- data.frame(row.names = HCC_cancer_scAtlas_cts$Gene)
+for(sample in unique(HCC_cancer_scAtlas$Sample)){
+  print(sample)
+  cell_IDs <- HCC_cancer_scAtlas[HCC_cancer_scAtlas$Sample==sample,]$Cell
+  cts_here <- rowSums(HCC_cancer_scAtlas_cts[,colnames(HCC_cancer_scAtlas_cts) %in% cell_IDs])
+  cts_here_bulk <- data.frame(cts_here, row.names = HCC_cancer_scAtlas_cts$Gene)
+  colnames(cts_here_bulk) <- paste0(sample,'_tumor')
+  cts_sc2bulk <- cbind(cts_sc2bulk,cts_here_bulk)
+}
+
+for(sample in unique(HCC_TECs_scAtlas$Sample)){
+  print(sample)
+  cell_IDs <- HCC_TECs_scAtlas[HCC_TECs_scAtlas$Sample==sample,]$Cell
+  cts_here <- rowSums(data.frame(HCC_TECs_cts[,colnames(HCC_TECs_cts) %in% cell_IDs]))
+  cts_here_bulk <- data.frame(cts_here, row.names = HCC_TECs_cts$Gene)
+  colnames(cts_here_bulk) <- paste0(sample,'_TECs')
+  cts_sc2bulk <- cbind(cts_sc2bulk,cts_here_bulk)
+}
+
+# clear up memory
+remove(scAtlasLC)
+cts_sc2bulk <- cts_sc2bulk + 1 # to avoid numerical overflow issues. only do this once! 
+```
+### scAtlasLC heatmap
+
+```{r}
+cell_colors <- list('Cell Type'=c('tumor'='forestgreen','TECs'='red'))
+colPheno<-data.frame(sub("^[^_]*_", "", colnames(cts_sc2bulk)),
+                     row.names=colnames(cts_sc2bulk))
+colnames(colPheno) <- 'Cell Type'
+rownames(colPheno)
+rowPheno<-cts_sc2bulk %>% 
+  mutate(Gene = rownames(cts_sc2bulk)) %>% 
+  mutate('Hoshida_type' = case_when(Gene %in% HoshidaGenes[HoshidaGenes$Set=='1',]$Genes ~ 'S1',
+                                 Gene %in% HoshidaGenes[HoshidaGenes$Set=='2',]$Genes ~ 'S2',
+                                 Gene %in% HoshidaGenes[HoshidaGenes$Set=='3',]$Genes ~ 'S3',
+                                 TRUE ~ 'Others'))%>%  
+  dplyr::select(Hoshida_type)
+
+rowPheno %>% group_by(Hoshida_type) %>% tally()
+
+cts_here <- scale(log2(cts_sc2bulk), scale = F) # center by sample first
+cts_here <- t(scale(t(cts_here), scale = F))# center by gene second
+
+topGenes <- 500
+clst<-bswClst.clust(cts_here,topNSdRows=topGenes, medianPolish = F, clusterRows = T, clusterCols = T)
+
+# short format
+save_path = paste0(output_path, '/scAtlas_heatmap_short_top',topGenes,'.pdf')
+bswClst.plotToFile(path=save_path,
+                   clst=clst,
+                   rowPheno=rowPheno,rowPhenoColorMaps = Hoshida_colors,rowDendroPlot=T,colDendroPlot=T,rowNamesLeftPlot=F,rowNamesRightPlot=F,
+                   colPheno=colPheno,colPhenoColorMaps = cell_colors,colNamesTopPlot=F,
+                   heatmapHeight='golden',
+                   heatmapAutoZlimMethod='range',
+                   heatmapRampOffset = -1,
+                   heatmapColorRampGamma=5,
+                   legendOffset=0.1,legendGex=2)
+ 
+# long format
+save_path = paste0(output_path, '/scAtlas_heatmap_long_top',topGenes,'.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   rowPheno=rowPheno,rowDendroPlot=T,
+                   rowPhenoColorMaps = Hoshida_colors,
+                   rowNamesLeftPlot=T,rowNamesRightPlot=T,
+                   colPheno=colPheno,colDendroPlot=T,colPhenoColorMaps = cell_colors,colNamesTopPlot=F,
+                   gex=0.2,
+                   heatmapAutoZlimMethod='range',
+                   heatmapRampOffset = -1,heatmapColorRampGamma=5,legendGex=1)
+
+# only Hoshida genes
+rowPheno_Hoshida <- rowPheno %>% filter(Hoshida_type!='Others')
+cts_here <- cts_here[rownames(cts_here)%in% rownames(rowPheno_Hoshida),] 
+
+clst<-bswClst.clust(cts_here,topNSdRows=600, medianPolish = F, clusterRows = T, clusterCols = T)
+# short format
+save_path = paste0(output_path, '/scAtlas_heatmap_Hoshida.pdf')
+bswClst.plotToFile(path=save_path,
+                   clst=clst,
+                   rowPheno=rowPheno,rowPhenoColorMaps = Hoshida_colors,rowDendroPlot=T,colDendroPlot=T,rowNamesLeftPlot=F,rowNamesRightPlot=F,
+                   colPheno=colPheno,colPhenoColorMaps = cell_colors,colNamesTopPlot=F,
+                   heatmapHeight='golden',
+                   heatmapRampOffset = -1,heatmapAutoZlimMethod='range',
+                   heatmapColorRampGamma=5)
+# long format
+save_path = paste0(output_path, '/scAtlas_heatmap_Hoshida_long.pdf')
+bswClst.plotToFile(path=save_path,clst=clst,
+                   rowPheno=rowPheno,rowPhenoColorMaps = Hoshida_colors,rowDendroPlot=T,colDendroPlot=T,rowNamesLeftPlot=F,rowNamesRightPlot=F,
+                   colPheno=colPheno,colPhenoColorMaps = cell_colors,colNamesTopPlot=F,
+                   gex=0.2,
+                   heatmapAutoZlimMethod='range',
+                   heatmapColorRampGamma=5)
+
+```
+### scAtlasLC DEA 
+```{r}
+##### volcano plots to compare between tumor and vessel cells #####
+# quantile normalization. ref: https://davetang.org/muse/2014/07/07/quantile-normalisation-in-r/ 
+quantile_normalisation <- function(df){
+  df_rank <- apply(df,2,rank,ties.method="min")
+  df_sorted <- data.frame(apply(df, 2, sort))
+  df_mean <- apply(df_sorted, 1, mean)
+   
+  index_to_mean <- function(my_index, my_mean){
+    return(my_mean[my_index])
+  }
+   
+  df_final <- apply(df_rank, 2, index_to_mean, my_mean=df_mean)
+  rownames(df_final) <- rownames(df)
+  return(df_final)
+}
+ 
+cts_here <- quantile_normalisation(cts_sc2bulk)
+
+df<- cts_here # normalized counts table
+de <- data.frame(sample=colnames(cts_here)) %>% 
+  mutate(cell_type = case_when(str_detect(sample,'tumor')~'tumor',
+                               str_detect(sample,'TECs')~'TECs',
+                               TRUE~''))
+rownames(de) <- de$sample
+
+# # rename sample column to be compatible with get_diffexp function
+df <- df[,colnames(df) %in% rownames(de)]
+de <- de[match(colnames(df), rownames(de)),]
+df <- df[,match(rownames(de),colnames(df))]
+
+colnames(df) == rownames(de)# double check
+
+dea<-get_diffexp(df,de,'Wilcoxon')
+
+# plot
+diffexp <- dea %>% mutate(delabel = case_when((padj_TECs_tumor < 0.05 & LFC_TECs_tumor > 1) ~ 'Vessel',
+                                                  (padj_TECs_tumor < 0.05 & LFC_TECs_tumor < -1) ~ 'Tumor',
+                                                  TRUE ~ 'Neither'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$delabel != 'Neither']<-rownames(diffexp)[diffexp$delabel != 'Neither']
+
+diffexp <- diffexp %>% mutate(Hoshida_gene_set = case_when((rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='1',]$Genes) ~ 'S1',
+                                              (rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='2',]$Genes) ~ 'S2',
+                                              (rownames(dea) %in% HoshidaGenes[HoshidaGenes$Set=='3',]$Genes) ~ 'S3',
+                                              TRUE ~ 'Others'))
+diffexp$lbl<-NA
+diffexp$lbl[diffexp$Hoshida_gene_set != 'Others']<-rownames(diffexp)[diffexp$Hoshida_gene_set != 'Others']
+
+write.csv(diffexp, paste0(output_path,'/scAtlas_Tum_vs_Vessel_dea.csv'))
+pdf(paste0(output_path,'/scAtlas_Tum_vs_Vessel_dea_Hoshida_color.pdf'))
+# reverse the LFC to be consistent with heatmap - purely visualization purposes
+tmp<-ggplot(data=diffexp,aes(x=-LFC_TECs_tumor,y=-log10(padj_TECs_tumor),col=Hoshida_gene_set, label=lbl, size=Hoshida_gene_set)) +
+  geom_point() + 
+  scale_color_manual('Hoshida set',values=c('S1'='black','S2'='dodgerblue3','S3'='forestgreen','Others'='gray'))+
+  scale_size_manual('Hoshida set',values=c('S1'=2,'S2'=2,'S3'=2,'Others'=1)) +
+  scale_alpha_manual('Hoshida set',values=c('S1'=1,'S2'=1,'S3'=1,'Others'=0.1)) +
+  theme_classic() +
+  geom_label_repel(size = 2, min.segment.length = 0, max.overlaps = 11,
+                  show.legend = FALSE) +
+  xlab(bquote(log[2]("tumor/vessel")))+
+  ylab(bquote(-log[10]("adjusted p-value")))+
+  geom_vline(xintercept=c(-1,1), linetype = "longdash",col="gray") +
+  geom_hline(yintercept=-log10(.05), linetype = "longdash",col="gray") +
+  guides(color = guide_legend(override.aes = list(size = 3)))+
+  theme(axis.text=element_text(size=18),
+        axis.title=element_text(size=18),
+        legend.title = element_text(size=18),
+        legend.text = element_text(size=18),
+        legend.position = 'bottom')
+
+print(tmp)
+dev.off()
+
+# get counts 
+diffexp %>% filter(Hoshida_gene_set=='S1') %>% group_by(delabel) %>% tally()
+diffexp %>% filter(Hoshida_gene_set=='S2') %>% group_by(delabel) %>% tally()
+diffexp %>% filter(Hoshida_gene_set=='S3') %>% group_by(delabel) %>% tally()
+```
